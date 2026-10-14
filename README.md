@@ -21,7 +21,7 @@
 ### 方式一：作为 ZCode 插件市场源
 
 1. 打开 ZCode → Settings → Plugins → Add marketplace，填入本仓库地址：
-   `https://github.com/LonelyzzZ-code/glm-image-viewer`
+   `https://github.com/LonelyzzZ-code/GLM5.3-image-viewer`
 2. 安装 `glm-image-viewer` 插件并启用。
 
 ### 方式二：手动注册 MCP server
