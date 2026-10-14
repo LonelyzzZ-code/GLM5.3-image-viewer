@@ -1,0 +1,14 @@
+{
+  "name": "glm-image-viewer",
+  "version": "0.2.0",
+  "description": "让主模型 GLM-5.3 需要看图时，通过 GLM-5.3-Flash 视觉模型分析图片并返回识别结果",
+  "author": { "name": "LonelyzzZ" },
+  "mcpServers": {
+    "glm-image-viewer": {
+      "command": "/usr/bin/python3",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-server/glm_image_server.py"],
+      "timeoutMs": 120000
+    }
+  },
+  "skills": "./skills"
+}

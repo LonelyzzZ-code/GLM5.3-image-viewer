@@ -1,0 +1,18 @@
+{
+  "name": "glm-image-viewer-marketplace",
+  "plugins": [
+    {
+      "name": "glm-image-viewer",
+      "source": "./",
+      "version": "0.2.0",
+      "description": "让主模型需要看图时，通过 GLM-5.3-Flash 视觉模型分析图片并返回识别结果",
+      "displayName": "GLM 图片识别",
+      "displayName_i18n": {
+        "zh-CN": "GLM 图片识别"
+      },
+      "description_i18n": {
+        "zh-CN": "让主模型调用 GLM-5.3-Flash 视觉模型识图并返回结果（支持本地文件/URL/base64），内置两段式超时、自动重试与调用日志"
+      }
+    }
+  ]
+}

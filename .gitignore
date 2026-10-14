@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 本机配置与日志（含 API Key，绝不提交）
+config.json
+*.log
+*.log.*
+
+# 安全扫描工具残留
+.mimosa/
+
+# macOS
+.DS_Store
+
+# 编辑器
+.idea/
+.vscode/
+# macOS AppleDouble 元数据（exFAT 盘）
+._*
