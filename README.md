@@ -46,7 +46,8 @@
   "api_key": "你的智谱API Key",
   "model": "glm-5.3-flash",
   "api_base": "https://open.bigmodel.cn/api/paas/v4",
-  "timeout": 18
+  "timeout": 18,
+  "fallback_model": "glm-4v-flash"
 }
 ```
 
@@ -56,6 +57,7 @@
 | `model` | `GLM_VISION_MODEL` | `glm-5.3-flash` | 视觉模型名 |
 | `api_base` | `ZHIPU_API_BASE` | `https://open.bigmodel.cn/api/paas/v4` | 兼容 one-api 等自建网关（支持 localhost/内网地址） |
 | `timeout` | `GLM_VISION_TIMEOUT` | `18` | 首次尝试总预算（秒），按 10:8 拆分给响应头/响应体 |
+| `fallback_model` | `GLM_VISION_FALLBACK_MODEL` | `glm-4v-flash` | 主模型重试用尽后的备用视觉模型，置空字符串禁用 |
 
 环境变量优先级高于配置文件。
 

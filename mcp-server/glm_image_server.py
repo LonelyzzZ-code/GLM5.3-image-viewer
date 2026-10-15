@@ -24,7 +24,7 @@ import urllib.error
 import urllib.request
 
 SERVER_NAME = "glm-image-viewer"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.2.1"
 TOOL_NAME = "analyze_image"
 
 DEFAULT_MODEL = "glm-5.3-flash"
@@ -40,15 +40,20 @@ MAX_IMAGE_BYTES = 8 * 1024 * 1024
 
 # 两段式超时：urlopen 返回 = 响应头已到；实测挂死形态是"头到、body 永不到"，
 # 而正常请求头到后 body 1 秒内到齐。因此头/body 分别计时，挂死可在头到达后
-# body_budget 秒内判定（约 10s），不必等满单次总预算。
+# body_budget 秒内判定，不必等满单次总预算。
 # 注意：resp.read() 走 socket.makefile() 文件流，不受 socket 超时控制，必须由
-# 主线程 Event.wait 兜底。预算：首次 头10s+body8s，重试 头7s+body4s，最坏 29.5s。
+# 主线程 Event.wait 兜底。预算：首次 头10s+body8s；重试 = 首次的 70%（不低于 7/4s）。
+# 重试结构：主模型 2 试（挂死类第二次前退避 RETRY_WAIT_LONG），仍失败则切换
+# fallback_model 再试 1 次（固定 10+8 预算）。实测 glm-5.3-flash 曾出现模型级
+# 图片处理故障（微图 11s/大图挂死）而 glm-4v-flash 正常，切换模型可绕开。
 HEAD_BUDGET = 10
 BODY_BUDGET = 8
-RETRY_HEAD_BUDGET = 7
-RETRY_BODY_BUDGET = 4
-MAX_ATTEMPTS = 2
-RETRY_WAIT = 0.5  # 两次尝试之间的间隔秒数
+RETRY_SCALE = 0.7
+RETRY_HEAD_MIN = 7
+RETRY_BODY_MIN = 4
+RETRY_WAIT = 0.5  # 常规重试间隔秒数
+RETRY_WAIT_LONG = 5  # 挂死类失败的退避，给服务端故障窗口恢复时间
+FALLBACK_MODEL = "glm-4v-flash"  # 主模型失败后的备用视觉模型；config 置空字符串禁用
 PROGRESS_INTERVAL = 8  # 客户端带 progressToken 时，每 N 秒发一次进度（重置客户端超时）
 
 TOOL_DEF = {
@@ -110,6 +115,7 @@ def load_config():
         "model": pick("GLM_VISION_MODEL", "model", DEFAULT_MODEL),
         "api_base": pick("ZHIPU_API_BASE", "api_base", DEFAULT_API_BASE),
         "timeout": pick("GLM_VISION_TIMEOUT", "timeout", HEAD_BUDGET + BODY_BUDGET),
+        "fallback_model": pick("GLM_VISION_FALLBACK_MODEL", "fallback_model", FALLBACK_MODEL),
     }
 
 
@@ -154,7 +160,7 @@ def get_attempt_timeout(cfg):
         return HEAD_BUDGET + BODY_BUDGET
 
 
-def call_vision_api_monitored(cfg, prompt, image_url, head_budget, body_budget):
+def call_vision_api_monitored(cfg, model, prompt, image_url, head_budget, body_budget):
     """两段式监控的 API 调用，返回 (状态, 值)。
 
     状态: "ok"（值=识别文本）| "error"（值=异常对象，含 HTTPError）
@@ -165,7 +171,7 @@ def call_vision_api_monitored(cfg, prompt, image_url, head_budget, body_budget):
     resp.read() 走 makefile 文件流不受 socket 超时控制，全靠 Event.wait 兜底。
     """
     body = {
-        "model": cfg["model"],
+        "model": model,
         "messages": [
             {
                 "role": "user",
@@ -248,50 +254,61 @@ def analyze_image(args):
     except ValueError as e:
         return True, "图片输入有误：%s" % e
 
-    # 首次预算按 config.timeout 总额的 10:8 拆头/body，重试用固定短预算
+    # 首次预算按 config.timeout 总额的 10:8 拆头/body，重试按首次的 70% 缩放（设下限）
     total = get_attempt_timeout(cfg)
     head1 = max(3, total * HEAD_BUDGET // (HEAD_BUDGET + BODY_BUDGET))
     body1 = max(2, total - head1)
-    budgets = [(head1, body1), (RETRY_HEAD_BUDGET, RETRY_BODY_BUDGET)]
+    retry_head = max(RETRY_HEAD_MIN, int(head1 * RETRY_SCALE))
+    retry_body = max(RETRY_BODY_MIN, int(body1 * RETRY_SCALE))
+    fallback_model = str(cfg.get("fallback_model") or "").strip()
+    img_kb = len(image_url) // 1024
 
+    # 主模型 2 试；仍失败则换备用模型 1 试（固定 10+8 预算），绕开模型级故障
+    rounds = []
+    if fallback_model and fallback_model != cfg["model"]:
+        rounds.append((fallback_model, [(HEAD_BUDGET, BODY_BUDGET)]))
     last_error = None
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        hb, bb = budgets[attempt - 1]
-        t0 = time.time()
-        try:
-            status, value = call_vision_api_monitored(cfg, prompt, image_url, hb, bb)
-        except Exception as e:  # 理论上不抛，防御保留
-            status, value = "error", e
-        log_event("attempt", attempt=attempt, status=status,
-                  cost=round(time.time() - t0, 1),
-                  err=None if (status == "ok" or value is None) else str(value)[:150])
-        if status == "ok":
-            if attempt > 1:
-                sys.stderr.write("attempt %d ok\n" % attempt)
-            log_event("call_done", ok=True, attempts=attempt,
-                      total=round(time.time() - t_start, 1))
-            return False, value
-        if status == "error" and isinstance(value, urllib.error.HTTPError):
-            # 5xx 是服务端瞬时故障，值得吃掉重试名额；4xx 是配置/输入问题，重试无意义
-            if 500 <= value.code < 600 and attempt < MAX_ATTEMPTS:
-                last_error = "API HTTP %d（服务端瞬时故障）" % value.code
-            else:
-                detail = value.read().decode("utf-8", "replace")[:500]
-                log_event("call_done", ok=False, http=value.code,
+    used_fallback = False
+    for model, budgets in [(cfg["model"], [(head1, body1), (retry_head, retry_body)])] + rounds:
+        if model != cfg["model"]:
+            used_fallback = True
+            log_event("fallback_model", model=model)
+        for attempt, (hb, bb) in enumerate(budgets, 1):
+            t0 = time.time()
+            try:
+                status, value = call_vision_api_monitored(cfg, model, prompt, image_url, hb, bb)
+            except Exception as e:  # 理论上不抛，防御保留
+                status, value = "error", e
+            log_event("attempt", model=model, attempt=attempt, status=status,
+                      size_kb=img_kb, cost=round(time.time() - t0, 1),
+                      err=None if (status == "ok" or value is None) else str(value)[:150])
+            if status == "ok":
+                log_event("call_done", ok=True, model=model, attempts=attempt,
                           total=round(time.time() - t_start, 1))
-                return True, "API 请求失败 HTTP %d：%s（当前模型 %s，如模型名不对可在 %s 的 model 字段修改）" % (
-                    value.code, detail, cfg["model"], CONFIG_PATH)
-        elif status == "head_timeout":
-            last_error = "API 连接/响应头 %d 秒未返回" % hb
-        elif status == "body_timeout":
-            last_error = "API 响应体 %d 秒未到达（服务端偶发无响应）" % bb
-        else:
-            last_error = "API 请求异常：%r" % value
-        if attempt < MAX_ATTEMPTS:
-            time.sleep(RETRY_WAIT)
+                if used_fallback:
+                    return False, "%s\n（注：主模型 %s 不可用，本次结果来自备用模型 %s）" % (
+                        value, cfg["model"], model)
+                return False, value
+            if status == "error" and isinstance(value, urllib.error.HTTPError):
+                # 4xx 是配置/输入问题，换模型/重试都无意义，立即失败
+                if not (500 <= value.code < 600):
+                    detail = value.read().decode("utf-8", "replace")[:500]
+                    log_event("call_done", ok=False, http=value.code,
+                              total=round(time.time() - t_start, 1))
+                    return True, "API 请求失败 HTTP %d：%s（当前模型 %s，如模型名不对可在 %s 的 model 字段修改）" % (
+                        value.code, detail, model, CONFIG_PATH)
+                last_error = "API HTTP %d（模型 %s）" % (value.code, model)
+            elif status == "head_timeout":
+                last_error = "API 连接/响应头 %d 秒未返回（模型 %s）" % (hb, model)
+            elif status == "body_timeout":
+                last_error = "API 响应体 %d 秒未到达（模型 %s）" % (bb, model)
+            else:
+                last_error = "API 请求异常（模型 %s）：%r" % (model, value)
+            hung = status in ("head_timeout", "body_timeout")
+            time.sleep(RETRY_WAIT_LONG if hung else RETRY_WAIT)
     log_event("call_done", ok=False, total=round(time.time() - t_start, 1))
-    return True, "%s；已自动重试 %d 次仍失败。请稍后再试，或在 %s 中增大 timeout 字段（单次总预算秒数）。历史调用记录见 %s" % (
-        last_error, MAX_ATTEMPTS - 1, CONFIG_PATH, LOG_PATH)
+    return True, "%s；主模型与备用模型均已重试失败，多为智谱服务端故障，建议稍后重试。也可在 %s 调整 model/timeout 字段。历史调用记录见 %s" % (
+        last_error, CONFIG_PATH, LOG_PATH)
 
 
 def send(obj):
